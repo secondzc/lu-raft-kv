@@ -80,6 +80,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
     private ElectionTask electionTask = new ElectionTask();
     private ReplicationFailQueueConsumer replicationFailQueueConsumer = new ReplicationFailQueueConsumer();
 
+    // todo：bug：这貌似是作者的一个bug，缺乏失败入队的操作
     private LinkedBlockingQueue<ReplicationFailModel> replicationFailQueue = new LinkedBlockingQueue<>(2048);
 
 
@@ -107,14 +108,17 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
     /* ============ 所有服务器上经常变的 ============= */
 
     /** 已知的最大的已经被提交的日志条目的索引值 */
+    // todo：这个值要小于logmodule中最大的值
     volatile long commitIndex;
 
     /** 最后被应用到状态机的日志条目索引值（初始化为 0，持续递增) */
+    // todo：没有找到lastApplied的get方法，暂时是多余的，其实就等于commitIndex
     volatile long lastApplied = 0;
 
     /* ========== 在领导人里经常改变的(选举后重新初始化) ================== */
 
     /** 对于每一个服务器，需要发送给他的下一个日志条目的索引值（初始化为领导人最后索引值加一） */
+    // todo  : 为初始化为领导人后啥要加一
     Map<Peer, Long> nextIndexs;
 
     /** 对于每一个服务器，已经复制给他的日志的最高索引值 */
@@ -172,6 +176,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
             delegate = new ClusterMembershipChangesImpl(this);
 
             RaftThreadPool.scheduleWithFixedDelay(heartBeatTask, 500);
+            // todo 选举时间间隔基数是15s，而不是这里的500ms，这里影响的是误差时间
             RaftThreadPool.scheduleAtFixedRate(electionTask, 6000, 500);
             RaftThreadPool.execute(replicationFailQueueConsumer);
 
@@ -239,6 +244,11 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
      *  领导人会不断的重复尝试附加日志条目 RPCs （尽管已经回复了客户端）直到所有的跟随者都最终存储了所有的日志条目。
      * @param request
      * @return
+     *
+     * todo：若不是leader则redirect，若是leader，先预提交到logModule，再向follower复制（replication），
+     * 如果过半数成功，则更新commitIndex和lastApplied，并真正提交到StateMachine中，否则，revert logModule中的提交。
+     * logModule中预提交的logEntry的key为index，而DefaultStateMachine中提交的logEntry的key为Command的真正key
+     * 可以看出，这个过程有点像2pc，先预提交，如果复制成功，则真正提交，只不过引入了半数的机制，而不是要所有follower都复制成功，比2pc性能好
      */
     @Override
     public synchronized ClientKVAck handlerClientRequest(ClientKVReq request) {
@@ -270,10 +280,13 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
 
         // 预提交到本地日志, TODO 预提交
         logModule.write(logEntry);
+        // todo：在write（）方法中更新了index
         LOGGER.info("write logModule success, logEntry info : {}, log index : {}", logEntry, logEntry.getIndex());
 
+        // todo：这里的success不存在多线程的问题，没必要用AtomicInteger
         final AtomicInteger success = new AtomicInteger(0);
 
+        // todo：返回值boolean表示replication（）成功或失败，感觉这里没必要用CopyOnWriteArrayList
         List<Future<Boolean>> futureList = new CopyOnWriteArrayList<>();
 
         int count = 0;
@@ -304,6 +317,11 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
 
         // 如果存在一个满足N > commitIndex的 N，并且大多数的matchIndex[i] ≥ N成立，
         // 并且log[N].term == currentTerm成立，那么令 commitIndex 等于这个 N （5.3 和 5.4 节）
+        /*
+         todo：上面这句话翻译过来的语义就是：matchIndex表示已经复制给follower的日志最高索引值，
+          如果大多数的follower的这个值都比commitIndex（leader上最大已经被提交的日志索引值）要大，且从leader本地的logModule读到的N对应的term==currentTerm
+          但我还是不知道下面这块代码的作用是啥？？如果成功一半，commitIndex就被341行更新了，如果不成功一半，这块代码才有意义。。。
+         */
         List<Long> matchIndexList = new ArrayList<>(matchIndexs.values());
         // 小于 2, 没有意义
         int median = 0;
@@ -320,6 +338,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
         }
 
         //  响应客户端(成功一半)
+        // todo：这里"一半"的语义和选举时不同，选举时包含了自己，这里的count不包含自己
         if (success.get() >= (count / 2)) {
             // 更新
             commitIndex = logEntry.getIndex();
@@ -359,6 +378,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
     }
 
 
+    // todo：通过DefaultNode.handlerClientRequest（）调用
     /** 复制到其他机器  */
     public Future<Boolean> replication(Peer peer, LogEntry entry) {
 
@@ -378,7 +398,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
 
                     aentryParam.setLeaderCommit(commitIndex);
 
-                    // 以我这边为准, 这个行为通常是成为 leader 后,首次进行 RPC 才有意义.
+                    // 以我这边为准, 这个行为通常是成为 leader 后,首次进行 RPC 才有意义. todo：这句话不理解？？
                     Long nextIndex = nextIndexs.get(peer);
                     LinkedList<LogEntry> logEntries = new LinkedList<>();
                     if (entry.getIndex() >= nextIndex) {
@@ -410,19 +430,29 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
                             return false;
                         }
                         AentryResult result = (AentryResult) response.getResult();
-                        if (result != null && result.isSuccess()) {
+                        /*
+                         * @return result.fail                    ，没获取到锁，直接返回                                              -----A
+                         *         result.fail && result.term有值  ，追加日志之前就冲突了，需要leader递减nextIndex重试                  -----B
+                         *         result.success                 ，（1）追加日志冲突，删除follower从冲突点开始之后的日志，并正常追加日志  ------C
+                         *                                          （2）追加日志重复（只比较logEntry[]的第一条），直接返回              ------D
+                         */
+                        if (result != null && result.isSuccess()) { //对应C D
                             LOGGER.info("append follower entry success , follower=[{}], entry=[{}]", peer, aentryParam.getEntries());
                             // update 这两个追踪值
                             nextIndexs.put(peer, entry.getIndex() + 1);
                             matchIndexs.put(peer, entry.getIndex());
                             return true;
-                        } else if (result != null) {
+                        } else if (result != null) { //对应B, 貌似没有考虑A这种情况？？
                             // 对方比我大
                             if (result.getTerm() > currentTerm) {
                                 LOGGER.warn("follower [{}] term [{}] than more self, and my term = [{}], so, I will become follower",
                                     peer, result.getTerm(), currentTerm);
                                 currentTerm = result.getTerm();
                                 // 认怂, 变成跟随者
+                                /*
+                                参看："Raft安全性和一致性"之"选举的限制"之：
+                                Raft 使用投票的方式，来阻止一个候选人赢得选举 —— 除非这个候选人包含了所有已经提交的日志条目。
+                                 */
                                 status = NodeStatus.FOLLOWER;
                                 return false;
                             } // 没我大, 却失败了,说明 index 不对.或者 term 不对.
@@ -538,7 +568,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
      *      重置选举超时计时器
      *      发送请求投票的 RPC 给其他所有服务器
      * 2. 如果接收到大多数服务器的选票，那么就变成领导人
-     * 3. 如果接收到来自新的领导人的附加日志 RPC，转变成跟随者
+     * 3. 如果接收到来自新的领导人的附加日志 RPC，转变成跟随者 todo ：这里博客上没有提到，这一点说的是：如果在选举过程中收到日志，说明已经选主完了，结束了选主过程
      * 4. 如果选举过程超时，再次发起一轮选举
      */
     class ElectionTask implements Runnable {
@@ -553,6 +583,7 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
             long current = System.currentTimeMillis();
             // 基于 RAFT 的随机时间,解决冲突.
             electionTime = electionTime + ThreadLocalRandom.current().nextInt(50);
+            // todo 每次心跳都会更新preElectionTime，实际上，如果leader的状态一直是健康的，那么每次到这里就短路return了，就不会重新选举
             if (current - preElectionTime < electionTime) {
                 return;
             }
@@ -632,6 +663,11 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
                                 success2.incrementAndGet();
                             } else {
                                 // 更新自己的任期.
+                                /*
+                                 todo 为什么下面只用sucess数过半就能判断自己是leader呢？即使是过半，如果出现有机器的term比自己的term大呢？
+                                 好像算法本身保证了不会出现这种情况。
+                                 */
+
                                 long resTerm = response.getResult().getTerm();
                                 if (resTerm >= currentTerm) {
                                     currentTerm = resTerm;
@@ -689,6 +725,11 @@ public class DefaultNode<T> implements Node<T>, LifeCycle, ClusterMembershipChan
         }
     }
 
+
+    /*
+    todo leader定期心跳轮询，如果发现有人的term比自己大，就把自己置为follwer，这里先不指定voteFor
+    心跳的消息复用了logEntry的结构，内容为空，
+     */
 
     class HeartBeatTask implements Runnable {
 

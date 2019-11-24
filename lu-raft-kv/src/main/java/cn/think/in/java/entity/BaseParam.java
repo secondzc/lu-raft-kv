@@ -17,6 +17,7 @@ public class BaseParam implements Serializable {
     /** 候选人的任期号  */
     public long term;
 
+    // todo 这是个无用的
     /** 被请求者 ID(ip:selfPort) */
     public String serverId;
 

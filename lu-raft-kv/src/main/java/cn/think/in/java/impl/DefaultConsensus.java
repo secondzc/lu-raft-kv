@@ -64,6 +64,10 @@ public class DefaultConsensus implements Consensus {
             LOGGER.info("node {} current vote for [{}], param candidateId : {}", node.peerSet.getSelf(), node.getVotedFor(), param.getCandidateId());
             LOGGER.info("node {} current term {}, peer term : {}", node.peerSet.getSelf(), node.getCurrentTerm(), param.getTerm());
 
+             /*
+              todo 如果自己已经投票，直接返回false，如果没投票，先判断对方是否比自己新，若是，则投给对方，question：什么时候清除本地的voteFor这个字段？
+              ans ：重新进行leader 选举的时候
+              */
             if ((StringUtil.isNullOrEmpty(node.getVotedFor()) || node.getVotedFor().equals(param.getCandidateId()))) {
 
                 if (node.getLogModule().getLast() != null) {
@@ -104,6 +108,18 @@ public class DefaultConsensus implements Consensus {
      *    如果已经存在的日志条目和新的产生冲突（索引值相同但是任期号不同），删除这一条和之后所有的 （5.3 节）
      *    附加任何在已有的日志中不存在的条目
      *    如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
+     *
+     *    todo：在DefaultNode.replication()和HeartBeatTask.run()两处调用，用于日志复制和心跳
+     *    需要关注一下，"如果冲突，则要减小nextIndexs值，直到一致为止"这个过程怎么实现的？？
+     *    ans：是在leader侧的replication（）方法中实现的： nextIndexs.put(peer, nextIndex - 1);
+     *    follower端的判断：这个方法主要是判断是否存在日志冲突
+     * @return result.fail                    ，没获取到锁，直接返回                                              -----A
+     *         result.fail && result.term有值  ，追加日志之前就冲突了，需要leader递减nextIndex重试                  -----B
+     *         result.success                 ，（1）追加日志冲突，删除follower从冲突点开始之后的日志，并正常追加日志  ------C
+     *                                          （2）追加日志重复（只比较logEntry[]的第一条），直接返回              ------D
+     *
+     *    为什么只需要比较入参的preIndex和follower的node.getLogModule().getLastIndex()？
+     *    参看："Raft日志复制"之"日志特性"：如果 2 个日志的相同的索引位置的日志条目的任期号相同，那么 Raft 就认为这个日志从头到这个索引之间全部相同
      */
     @Override
     public AentryResult appendEntries(AentryParam param) {
@@ -123,7 +139,7 @@ public class DefaultConsensus implements Consensus {
             node.preElectionTime = System.currentTimeMillis();
             node.peerSet.setLeader(new Peer(param.getLeaderId()));
 
-            // 够格
+            // 够格 todo:感觉这个判断是多余的
             if (param.getTerm() >= node.getCurrentTerm()) {
                 LOGGER.debug("node {} become FOLLOWER, currentTerm : {}, param Term : {}, param serverId",
                     node.peerSet.getSelf(), node.currentTerm, param.getTerm(), param.getServerId());
@@ -164,6 +180,11 @@ public class DefaultConsensus implements Consensus {
                 node.getLogModule().removeOnStartIndex(param.getPrevLogIndex() + 1);
             } else if (existLog != null) {
                 // 已经有日志了, 不能重复写入.
+                /*
+                 todo：这里existLog.getTerm()==param.getEntries()[0],只判断了follower的下一条和请求参数数组中的第一条重复，就直接返回，不比较后面的了，
+                 因为这一批数据是原子写入的
+                 */
+
                 result.setSuccess(true);
                 return result;
             }
@@ -175,6 +196,12 @@ public class DefaultConsensus implements Consensus {
                 result.setSuccess(true);
             }
 
+            /*
+             todo：走到这一步，说明是C这种情况，（这个代码结构需要调整一下，可读性不太好）
+             ques：为什么会出现leaderCommit>commitIndex这种情况呢？
+             ans：因为C这种情况是删除了一些follower的日志，又追加了请求参数中的logEntry[]条目，这时
+             follower中的commitIndex和请求参数中leaderCommit的大小是不确定的。这就对应的是"多多少少"这种情况。
+             */
             //如果 leaderCommit > commitIndex，令 commitIndex 等于 leaderCommit 和 新日志条目索引值中较小的一个
             if (param.getLeaderCommit() > node.getCommitIndex()) {
                 int commitIndex = (int) Math.min(param.getLeaderCommit(), node.getLogModule().getLastIndex());

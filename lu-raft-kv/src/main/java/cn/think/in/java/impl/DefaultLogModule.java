@@ -36,6 +36,7 @@ public class DefaultLogModule implements LogModule {
     public static String dbDir;
     public static String logsDir;
 
+    // TODO:RocksDB:本地的kv存储
     private static RocksDB logDb;
 
     public final static byte[] LAST_INDEX_KEY = "LAST_INDEX_KEY".getBytes();

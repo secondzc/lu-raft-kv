@@ -22,6 +22,7 @@ public class AentryParam extends BaseParam {
     /** 领导人的 Id，以便于跟随者重定向请求 */
     String leaderId;
 
+    // todo：prevLogIndex和preLogTerm的作用：用于在follower写日志的时候判断存不存在冲突
     /**新的日志条目紧随之前的索引值  */
     long prevLogIndex;
 
